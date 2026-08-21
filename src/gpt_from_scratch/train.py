@@ -7,9 +7,9 @@ from pathlib import Path
 
 import torch
 
-from chance.data import download_tiny_shakespeare, load_text, train_val_split
-from chance.model import GPT, GPTConfig
-from chance.tokenizer import CharTokenizer
+from gpt_from_scratch.data import download_tiny_shakespeare, load_text, train_val_split
+from gpt_from_scratch.model import GPT, GPTConfig
+from gpt_from_scratch.tokenizer import CharTokenizer
 
 
 def parse_args() -> argparse.Namespace:

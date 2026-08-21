@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from chance.model import GPT, GPTConfig
+from gpt_from_scratch.model import GPT, GPTConfig
 
 
 def tiny_config() -> GPTConfig:

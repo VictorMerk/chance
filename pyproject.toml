@@ -1,5 +1,5 @@
 [project]
-name = "chance"
+name = "gpt-from-scratch"
 version = "0.1.0"
 description = "A small GPT-style language model built from scratch"
 readme = "README.md"
@@ -14,8 +14,8 @@ requires = ["uv_build>=0.11.11,<0.12.0"]
 build-backend = "uv_build"
 
 [project.scripts]
-chance-train = "chance.train:main"
-chance-sample = "chance.sample:main"
+gpt-from-scratch-train = "gpt_from_scratch.train:main"
+gpt-from-scratch-sample = "gpt_from_scratch.sample:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.8"]

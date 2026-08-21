@@ -1,6 +1,6 @@
 import pytest
 
-from chance.data import train_val_split
+from gpt_from_scratch.data import train_val_split
 
 
 def test_split_returns_expected_proportions() -> None:

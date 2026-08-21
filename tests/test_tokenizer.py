@@ -1,6 +1,6 @@
 import pytest
 
-from chance.tokenizer import CharTokenizer
+from gpt_from_scratch.tokenizer import CharTokenizer
 
 
 def test_from_text_builds_sorted_unique_vocab() -> None:

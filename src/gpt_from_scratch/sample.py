@@ -5,8 +5,8 @@ from pathlib import Path
 
 import torch
 
-from chance.model import GPT, GPTConfig
-from chance.tokenizer import CharTokenizer
+from gpt_from_scratch.model import GPT, GPTConfig
+from gpt_from_scratch.tokenizer import CharTokenizer
 
 
 def parse_args() -> argparse.Namespace:
