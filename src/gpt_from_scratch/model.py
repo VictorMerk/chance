@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,7 @@ class GPTConfig:
     norm_type: str = "layernorm"  # "rmsnorm" replaces every LayerNorm
     mlp_type: str = "gelu"  # "swiglu" uses an LLaMA-style gated MLP
     tie_embeddings: bool = True
+    pre_norm: bool = True  # False switches Blocks to original Transformer/GPT-1 post-norm
 
     def __post_init__(self) -> None:
         if self.pos_encoding not in ("learned", "rope"):
@@ -38,7 +40,7 @@ class GPTConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict[str, int | float]) -> GPTConfig:
+    def from_dict(cls, d: dict[str, Any]) -> GPTConfig:
         return cls(**d)
 
 
@@ -75,6 +77,8 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         # None buffers keep state_dict keys identical to a learned-position model.
+        self.rope_cos: torch.Tensor | None
+        self.rope_sin: torch.Tensor | None
         self.register_buffer("rope_cos", None, persistent=False)
         self.register_buffer("rope_sin", None, persistent=False)
         if config.pos_encoding == "rope":
@@ -156,14 +160,21 @@ class SwiGLU(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
+        self.pre_norm = config.pre_norm
         self.ln1 = _build_norm(config)
         self.attn = CausalSelfAttention(config)
-        self.ln2 = _build_norm(config)
+        if config.pre_norm:
+            self.ln2 = _build_norm(config)
         self.mlp: MLP | SwiGLU = MLP(config) if config.mlp_type == "gelu" else SwiGLU(config)
 
     def forward(
         self, x: torch.Tensor, past_kv: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if not self.pre_norm:
+            # Post-norm (original Transformer/GPT-1): a single norm after the MLP residual.
+            h, present = self.attn(x, past_kv)
+            x = x + h
+            return self.ln1(x + self.mlp(x)), present
         h, present = self.attn(self.ln1(x), past_kv)
         x = x + h
         return x + self.mlp(self.ln2(x)), present
@@ -200,6 +211,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         residual_std = 0.02 / math.sqrt(2 * config.n_layer)
         for block in self.blocks:
+            assert isinstance(block, Block)  # narrow past nn.ModuleList's loose item type
             nn.init.normal_(block.attn.proj.weight, mean=0.0, std=residual_std)
             nn.init.normal_(block.mlp.proj.weight, mean=0.0, std=residual_std)
 
