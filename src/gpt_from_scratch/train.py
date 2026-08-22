@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -9,7 +10,14 @@ import torch
 
 from gpt_from_scratch.data import download_tiny_shakespeare, load_text, train_val_split
 from gpt_from_scratch.model import GPT, GPTConfig
+from gpt_from_scratch.schedule import get_lr
 from gpt_from_scratch.tokenizer import CharTokenizer
+
+DTYPES: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,9 +33,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-embd", type=int, default=384)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr-warmup-iters", type=int, default=100)
+    parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--dtype", choices=list(DTYPES), default="float32")
     parser.add_argument("--eval-interval", type=int, default=250)
     parser.add_argument("--eval-iters", type=int, default=50)
+    parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--log-file", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=1337)
     return parser.parse_args()
 
@@ -48,7 +63,26 @@ def get_batch(
     ix = torch.randint(len(data) - block_size - 1, (batch_size,))
     x = torch.stack([data[i : i + block_size] for i in ix])
     y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
-    return x.to(device), y.to(device)
+    if device.type == "cuda":
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(device)
+        y = y.to(device)
+    return x, y
+
+
+def forward_loss(
+    model: GPT, x: torch.Tensor, y: torch.Tensor, amp_dtype: torch.dtype | None
+) -> torch.Tensor:
+    ctx = (
+        torch.autocast(device_type="cuda", dtype=amp_dtype)
+        if amp_dtype is not None
+        else contextlib.nullcontext()
+    )
+    with ctx:
+        _, loss = model(x, y)
+    return loss
 
 
 @torch.no_grad()
@@ -57,6 +91,7 @@ def estimate_loss(
     splits: dict[str, torch.Tensor],
     args: argparse.Namespace,
     device: torch.device,
+    amp_dtype: torch.dtype | None = None,
 ) -> dict[str, float]:
     model.eval()
     losses = {}
@@ -64,15 +99,50 @@ def estimate_loss(
         total = 0.0
         for _ in range(args.eval_iters):
             x, y = get_batch(data, args.batch_size, args.block_size, device)
-            _, loss = model(x, y)
+            loss = forward_loss(model, x, y, amp_dtype)
             total += loss.item()
         losses[split] = total / args.eval_iters
     model.train()
     return losses
 
 
+def save_checkpoint(
+    model: GPT,
+    optimizer: torch.optim.Optimizer,
+    config: GPTConfig,
+    vocab: list[str],
+    iteration: int,
+    val_loss: float,
+    path: Path,
+) -> None:
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "config": config.to_dict(),
+            "vocab": vocab,
+            "iteration": iteration,
+            "val_loss": val_loss,
+        },
+        path,
+    )
+
+
+def format_eta(seconds: float) -> str:
+    total = max(int(seconds), 0)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def main() -> None:
     args = parse_args()
+    if args.grad_accum < 1:
+        raise ValueError("grad_accum must be at least 1")
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
 
@@ -93,39 +163,94 @@ def main() -> None:
     )
     model = GPT(config).to(device)
     optimizer = model.configure_optimizers(lr=args.lr, weight_decay=args.weight_decay)
+
+    start_iter = 0
+    best_val_loss = float("inf")
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_iter = int(checkpoint["iteration"])
+        best_val_loss = float(checkpoint.get("val_loss", float("inf")))
+        print(f"resumed from {args.resume} at iteration {start_iter}")
+
+    min_lr = args.lr * args.lr_min_ratio
+    amp_dtype = DTYPES[args.dtype] if device.type == "cuda" else None
+    use_scaler = device.type == "cuda" and amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     print(f"device={device} parameters={model.num_parameters():,}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-    for iteration in range(1, args.max_iters + 1):
-        x, y = get_batch(train_data, args.batch_size, args.block_size, device)
-        _, loss = model(x, y)
+    tokens_per_step = args.batch_size * args.block_size * args.grad_accum
+    eval_start = time.time()
+    last_eval_iter = start_iter
+    tokens_since_eval = 0
+    losses: dict[str, float] = {}
+    for iteration in range(start_iter + 1, args.max_iters + 1):
+        lr = get_lr(
+            iteration,
+            max_lr=args.lr,
+            min_lr=min_lr,
+            warmup_iters=args.lr_warmup_iters,
+            max_iters=args.max_iters,
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        for _ in range(args.grad_accum):
+            x, y = get_batch(train_data, args.batch_size, args.block_size, device)
+            loss = forward_loss(model, x, y, amp_dtype)
+            scaler.scale(loss / args.grad_accum).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        tokens_since_eval += tokens_per_step
 
         if iteration % args.eval_interval == 0 or iteration == args.max_iters:
-            losses = estimate_loss(model, splits, args, device)
-            elapsed = time.time() - t0
+            losses = estimate_loss(model, splits, args, device, amp_dtype)
+            elapsed = time.time() - eval_start
+            steps_since_eval = iteration - last_eval_iter
+            tokens_per_sec = tokens_since_eval / elapsed if elapsed > 0 else 0.0
+            seconds_per_step = elapsed / steps_since_eval if steps_since_eval > 0 else 0.0
+            eta_seconds = (args.max_iters - iteration) * seconds_per_step
             print(
                 f"iter {iteration:5d} | train {losses['train']:.4f} | "
-                f"val {losses['val']:.4f} | {elapsed:.1f}s"
+                f"val {losses['val']:.4f} | lr {lr:.2e} | "
+                f"{tokens_per_sec:,.0f} tok/s | eta {format_eta(eta_seconds)} | {elapsed:.1f}s"
             )
+            if args.log_file is not None:
+                record = {
+                    "iter": iteration,
+                    "train_loss": losses["train"],
+                    "val_loss": losses["val"],
+                    "lr": lr,
+                    "tokens_per_sec": tokens_per_sec,
+                }
+                with args.log_file.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record) + "\n")
+            if losses["val"] < best_val_loss:
+                best_val_loss = losses["val"]
+                best_path = args.out_dir / "checkpoint-best.pt"
+                save_checkpoint(
+                    model, optimizer, config, tokenizer.vocab, iteration, best_val_loss, best_path
+                )
+                print(f"saved checkpoint to {best_path}")
+            last_eval_iter = iteration
+            tokens_since_eval = 0
+            eval_start = time.time()
 
-    checkpoint_path = args.out_dir / "checkpoint.pt"
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "config": config.to_dict(),
-            "vocab": tokenizer.vocab,
-            "iteration": args.max_iters,
-            "val_loss": losses["val"],
-        },
-        checkpoint_path,
+    if not losses:
+        losses = estimate_loss(model, splits, args, device, amp_dtype)
+
+    final_path = args.out_dir / "checkpoint.pt"
+    save_checkpoint(
+        model, optimizer, config, tokenizer.vocab, args.max_iters, losses["val"], final_path
     )
     meta = {"val_loss": losses["val"], "parameters": model.num_parameters()}
     (args.out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"saved checkpoint to {checkpoint_path}")
+    print(f"saved checkpoint to {final_path}")
 
 
 if __name__ == "__main__":
