@@ -10,7 +10,7 @@ A small GPT-style language model built entirely from scratch in PyTorch — no `
 
 ## Why this repo
 
-Most "build a GPT" projects stop at a toy loop around someone else's attention. Here every load-bearing piece is hand-implemented and tested: multi-head causal **attention** (via `F.scaled_dot_product_attention`), the causal **masking** logic (including the explicit-mask path for cached decoding), **weight tying** between input embeddings and the LM head, correct **AdamW weight-decay grouping**, a byte-level **BPE tokenizer** trained from scratch, a warmup + cosine **LR schedule**, and an incremental **KV cache** for fast generation. The whole thing is one readable Python package with six CLI entry points, full test coverage on CPU-only CI, and honest documentation.
+Most "build a GPT" projects stop at a toy loop around someone else's attention. Here every load-bearing piece is hand-implemented and tested: multi-head causal **attention** (via `F.scaled_dot_product_attention`), the causal **masking** logic (including the explicit-mask path for cached decoding), **weight tying** between input embeddings and the LM head, correct **AdamW weight-decay grouping**, a byte-level **BPE tokenizer** trained from scratch, a warmup + cosine **LR schedule**, and an incremental **KV cache** for fast generation. The whole thing is one readable Python package with six CLI entry points, full test coverage on CPU-only CI, and honest documentation. Around that core sit reproducible **experiment drivers**, checkpoint **export** to Hugging Face and ONNX formats, an OpenAI-compatible **serving endpoint**, and binary token-cache tooling for larger datasets.
 
 ## Features
 
@@ -19,13 +19,34 @@ Most "build a GPT" projects stop at a toy loop around someone else's attention. 
 - Decoder-only transformer with pre-norm residual blocks and tied input/output embeddings by default (`model.py`)
 - Causal self-attention through `F.scaled_dot_product_attention` (Flash Attention / memory-efficient path)
 - Incremental decoding with a per-layer KV cache; cached and uncached generation verified equivalent
-- Configurable architecture: RoPE or learned positions, LayerNorm or RMSNorm, GELU or SwiGLU MLP, tied or untied embeddings (`GPTConfig`)
+- Configurable architecture: RoPE or learned positions, LayerNorm or RMSNorm, GELU or SwiGLU MLP, tied or untied embeddings, pre-norm or post-norm blocks (`GPTConfig`)
 - GPT-2 style initialization with residual-output projections scaled by `1/sqrt(2 * n_layer)`
 - Model size presets (`nano` / `micro` / `small` / `medium`) plus fully configurable dimensions
 
 **Tokenization**
 
 - Character-level tokenizer and a from-scratch byte-pair-encoding tokenizer (`train` / `encode` / `decode` / `save` / `load`)
+- BPE with GPT-2-style pre-tokenization: contractions, letter runs, digit runs, and symbol runs are chunked so merges never cross chunk boundaries
+- Special tokens with reserved ids after the merge vocab — `encode_with_special` recognizes their literal forms (greedy longest-first), `decode` restores them, and they persist through `save`/`load`
+
+**Data**
+
+- Generic corpus loader for any UTF-8 `.txt`/`.md` file (`data.load_corpus`)
+- Raw binary token cache: uint16/uint32 `.bin` files written by `dataset.save_tokens_bin`, loaded zero-copy from a read-only memory map via `torch.frombuffer`
+- Dataset statistics report (token counts, id ranges, top-10 tokens with decoded previews) via `python -m gpt_from_scratch.dataset`
+- Train directly on pre-tokenized data with `gpt-from-scratch-train --data-format bin`
+
+**Experiments**
+
+- Reproducible short-run studies on shakespeare-char sharing one seeded runner (`experiments/_runner.py`)
+- Scaling probe: validation loss vs parameter count across model presets, with optional plot
+- LR-schedule ablation: constant vs cosine vs warmup+cosine on identical twin runs, with schedule-overlay and loss-bar plots
+
+**Export & serving**
+
+- Checkpoint export to Hugging Face GPT-2 format (`config.json` + `pytorch_model.bin` + `vocab.json`)
+- ONNX export (opset 17, dynamic batch and sequence axes)
+- OpenAI-compatible `/v1/completions` server backed by FastAPI (optional `serve` extra)
 
 **Training**
 
@@ -103,7 +124,7 @@ All six entry points are installed as console scripts by `pip install .` / `uv s
 
 | Command | Purpose | Key flags |
 | --- | --- | --- |
-| `gpt-from-scratch-train` | Train on tiny Shakespeare | `--data-dir` (data), `--out-dir` (checkpoints), `--device`, `--max-iters` (5000), `--batch-size` (64), `--block-size` (256), `--n-layer/--n-head/--n-embd` (6/6/384), `--dropout` (0.1), `--lr` (1e-3), `--lr-warmup-iters` (100), `--lr-min-ratio` (0.1), `--weight-decay` (0.1), `--grad-accum` (1), `--grad-clip` (1.0), `--dtype float32\|bfloat16\|float16`, `--eval-interval` (250), `--eval-iters` (50), `--resume PATH`, `--log-file PATH`, `--seed` (1337), `--ema` with `--ema-decay` (0.999), `--save-top-k INT` (0 = off), `--deterministic`, `--overfit-batches INT` (0 = off) |
+| `gpt-from-scratch-train` | Train on tiny Shakespeare, or on pre-tokenized `.bin` data | `--data-dir` (data), `--data-format text\|bin` (`text`; `bin` loads `<data-dir>/train.bin` + `val.bin` + `train.bin.vocab.json`), `--out-dir` (checkpoints), `--device`, `--max-iters` (5000), `--batch-size` (64), `--block-size` (256), `--n-layer/--n-head/--n-embd` (6/6/384), `--dropout` (0.1), `--lr` (1e-3), `--lr-warmup-iters` (100), `--lr-min-ratio` (0.1), `--weight-decay` (0.1), `--grad-accum` (1), `--grad-clip` (1.0), `--dtype float32\|bfloat16\|float16`, `--eval-interval` (250), `--eval-iters` (50), `--resume PATH`, `--log-file PATH`, `--seed` (1337), `--ema` with `--ema-decay` (0.999), `--save-top-k INT` (0 = off), `--deterministic`, `--overfit-batches INT` (0 = off) |
 | `gpt-from-scratch-sample` | Generate text from a checkpoint | `--checkpoint` (checkpoints/checkpoint.pt), `--prompt` ("\n"), `--max-new-tokens` (500), `--temperature` (0.8), `--top-k`, `--top-p`, `--min-p`, `--seed` (1337), `--stream`, `--stop STR` (repeatable), `--prompts-file PATH` (one prompt per line; blank lines and `#` comments skipped), `--interactive` (REPL with `/temp X`, `/top-k X`, `/top-p X`, `/min-p X`, `/quit`) |
 | `gpt-from-scratch-evaluate` | Perplexity + bits/char on validation data | `--checkpoint` (required), `--data-dir` (data), `--max-batches` (50), `--batch-size` (64), `--device` |
 | `gpt-from-scratch-benchmark` | Cached vs uncached tokens/sec | `--checkpoint` (optional; random tiny model if omitted), `--batch-size` (8), `--max-new-tokens` (100), `--device` |
@@ -116,9 +137,23 @@ Model size presets are importable from Python:
 from gpt_from_scratch.model import GPT_PRESETS  # nano / micro / small / medium GPTConfigs
 ```
 
+### Module CLIs
+
+These entry points have no console script; run them as modules:
+
+| Invocation | Purpose | Key flags |
+| --- | --- | --- |
+| `uv run python -m gpt_from_scratch.dataset` | Statistics for pre-tokenized `.bin` data | `--bin-prefix` (`data/`; reads `<prefix>train.bin` and `<prefix>val.bin`, with decoded top-token previews when `<prefix>train.bin.vocab.json` exists) |
+| `uv run python -m gpt_from_scratch.export` | Export a checkpoint to HF GPT-2 or ONNX format | `--checkpoint` (checkpoints/checkpoint.pt), `--format hf\|onnx` (required), `--out PATH` (required). Needs the classic GPT-2 recipe (see below) |
+| `uv run python -m gpt_from_scratch.serve` | OpenAI-compatible completions server | `--checkpoint` (checkpoints/checkpoint.pt), `--host` (127.0.0.1), `--port` (8000). Requires the serve extra |
+| `uv run python -m gpt_from_scratch.experiments.scaling` | Scaling probe across model presets | `--sizes` (nano,micro,small), `--max-iters` (300), `--device`, `--seed` (1337), `--out` (scaling_results.json), `--plot` with `--plot-out` (scaling.png) |
+| `uv run python -m gpt_from_scratch.experiments.lr_ablation` | LR-schedule ablation | `--max-iters` (300), `--lr` (1e-3), `--warmup-iters` (100), tiny config via `--n-layer/--n-head/--n-embd` (2/2/128), `--device`, `--seed` (1337), `--out` (lr_ablation_results.json), `--plot` with `--plot-out` (lr_ablation.png) |
+
+The experiment studies are covered in detail in [EXPERIMENTS.md](EXPERIMENTS.md).
+
 ### Configuration options
 
-Four switches on `GPTConfig` change the architecture; all default to the classic GPT-2 recipe:
+Five switches on `GPTConfig` change the architecture; all default to the classic GPT-2 recipe:
 
 | Option | Choices | Default | Effect |
 | --- | --- | --- | --- |
@@ -126,8 +161,42 @@ Four switches on `GPTConfig` change the architecture; all default to the classic
 | `norm_type` | `"layernorm"` / `"rmsnorm"` | `"layernorm"` | LayerNorm vs RMSNorm in every block and the final norm |
 | `mlp_type` | `"gelu"` / `"swiglu"` | `"gelu"` | 4x-expansion GELU MLP vs LLaMA-style gated SwiGLU (hidden = 8/3 * n_embd rounded up to a multiple of 8, bias-free) |
 | `tie_embeddings` | `True` / `False` | `True` | share weights between input embeddings and the LM head |
+| `pre_norm` | `True` / `False` | `True` | pre-norm blocks (modern default) vs original Transformer/GPT-1 post-norm for ablations |
 
 Sampling adds one more knob: `generate(min_p=...)`, exposed as `--min-p` on the generation CLI (default off). Tokens whose probability falls below `min_p * max_prob` are dropped before renormalizing; see [MATH.md](MATH.md) for all of these formulas.
+
+## Export & serving
+
+Both export targets speak standard formats, so trained checkpoints leave this repo as first-class citizens. Install the optional runtime extras you need:
+
+```bash
+uv sync --extra plot --extra serve --extra onnx
+```
+
+```bash
+# Hugging Face GPT-2 directory: config.json + pytorch_model.bin + vocab.json
+uv run python -m gpt_from_scratch.export \
+  --checkpoint checkpoints/checkpoint.pt --format hf --out exports/hf
+
+# ONNX graph: input_ids -> logits, opset 17, dynamic batch/sequence axes
+uv run python -m gpt_from_scratch.export \
+  --checkpoint checkpoints/checkpoint.pt --format onnx --out exports/model.onnx
+
+# OpenAI-compatible completions API on http://127.0.0.1:8000
+uv run python -m gpt_from_scratch.serve --checkpoint checkpoints/checkpoint.pt
+```
+
+Then query the server like any OpenAI-style endpoint:
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "ROMEO:", "max_tokens": 64, "temperature": 0.8, "top_p": 0.9, "stop": ["\n\n"]}'
+```
+
+The response follows the OpenAI `text_completion` shape — `choices[0].text`, `finish_reason` (`stop` when a stop string matched, otherwise `length`), plus `usage.prompt_tokens` / `usage.completion_tokens`.
+
+Note the constraint shared by both exporters: only the classic GPT-2 recipe is representable (learned positions, LayerNorm, GELU MLP, pre-norm blocks, tied embeddings); other configs raise `NotImplementedError`. The exported HF directory loads with `transformers.GPT2LMHeadModel.from_pretrained("exports/hf")`. A fill-in [model card](docs/model_card.md) template documents each published checkpoint.
 
 ## Train on Google Colab (free GPU)
 
@@ -151,20 +220,31 @@ then run `!gpt-from-scratch-train --device cuda --dtype bfloat16` to start train
 gpt-from-scratch/
 ├── src/gpt_from_scratch/
 │   ├── model.py        # GPT, GPTConfig, presets, KV cache, sampling, AdamW grouping
-│   ├── bpe.py          # BPETokenizer: train / encode / decode / save / load
+│   ├── bpe.py          # BPETokenizer: pre-tokenization, merges, special tokens
 │   ├── tokenizer.py    # CharTokenizer
-│   ├── data.py         # tiny Shakespeare download, train/val split
+│   ├── data.py         # tiny Shakespeare download, generic .txt/.md corpus loader
+│   ├── dataset.py      # .bin token cache save/load (mmap), dataset statistics CLI
 │   ├── schedule.py     # warmup + cosine decay LR schedule
-│   ├── train.py        # training-loop CLI
+│   ├── train.py        # training-loop CLI (--data-format text|bin)
 │   ├── sample.py       # generation CLI
 │   ├── evaluate.py     # perplexity / bits-per-character CLI
 │   ├── benchmark.py    # cached vs uncached throughput CLI
 │   ├── plots.py        # loss curves from JSONL training logs (gpt-from-scratch-plot)
-│   └── sweep.py        # temperature x top-k x top-p grid sweep (gpt-from-scratch-sweep)
+│   ├── sweep.py        # temperature x top-k x top-p grid sweep (gpt-from-scratch-sweep)
+│   ├── export.py       # Hugging Face GPT-2 / ONNX export (python -m ... export)
+│   ├── serve.py        # OpenAI-compatible completions server (python -m ... serve)
+│   └── experiments/    # scaling probe + LR ablation on a shared seeded runner
 ├── tests/              # pytest suite mirroring the source modules
+├── docs/
+│   ├── model_card.md   # fill-in model card template with worked example
+│   └── research/       # research-log write-ups (planned series)
 ├── notebooks/
 │   └── gpt_from_scratch_colab.ipynb   # one-click Colab training
-├── .github/workflows/ci.yml          # lint + tests on Python 3.12 / 3.13 with coverage
+├── .github/workflows/
+│   ├── ci.yml          # lint + typecheck + tests on Python 3.12 / 3.13 with coverage
+│   ├── release.yml     # build sdist/wheel artifacts on v* tags
+│   └── smoke.yml       # manual tiny end-to-end train+sample run
+├── EXPERIMENTS.md      # guide to the experiment studies
 ├── Makefile             # common dev commands (test, lint, train-small, plot, sweep, clean)
 ├── Dockerfile           # CPU-only torch image; training CLI as entrypoint
 └── pyproject.toml
@@ -174,6 +254,7 @@ gpt-from-scratch/
 
 ```bash
 uv sync --dev                 # install with dev dependencies
+uv sync --extra plot --extra serve --extra onnx   # add optional runtime extras as needed
 uv run pytest -q              # run tests
 uv run ruff check .           # lint
 uv run ruff format .          # format
@@ -191,11 +272,11 @@ docker run --rm -v "$PWD/checkpoints:/app/checkpoints" gpt-from-scratch --max-it
 
 Dependabot keeps pip dependencies and GitHub Actions up to date with weekly checks.
 
-CI runs ruff and the full test suite with coverage reporting on Python 3.12 and 3.13 for every push and pull request. See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and how to pick up a roadmap item.
+CI runs ruff, a mypy type-check job over `src/`, and the full test suite with coverage reporting on Python 3.12 and 3.13 for every push and pull request. Pushing a `v*` tag triggers a release workflow that runs the tests and uploads built sdist/wheel artifacts, and a manually triggered smoke workflow trains a tiny model end-to-end (train + sample) and uploads its checkpoint. See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and how to pick up a roadmap item.
 
 ## Roadmap
 
-100 planned improvements are tracked in [ROADMAP.md](ROADMAP.md); checked items have shipped.
+100 planned improvements are tracked in [ROADMAP.md](ROADMAP.md); checked items have shipped through milestone 3.
 
 ## Results
 

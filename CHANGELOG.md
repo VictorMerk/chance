@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-22
+
+Third milestone: GPT-2-grade tokenization, binary data caching with dataset tooling, reproducible experiment drivers, checkpoint export to standard formats, an OpenAI-compatible serving endpoint, and expanded CI automation.
+
+### Added
+
+- BPE pre-tokenization: GPT-2-style chunking (contractions, letter runs, digit runs, other-symbol runs; a single leading space attaches to the following chunk) hand-rolled from unicode property checks so merges never cross chunk boundaries during training or encoding.
+- Special tokens on `BPETokenizer(special_tokens=...)`: ids reserved immediately after all merges, `encode_with_special` maps literal occurrences greedy-longest-first (plain `encode` leaves them as text), `decode` restores their literal forms, vocab size accounting reserves room for them, and they persist through `save`/`load`.
+- Dataset tooling (`dataset.py`): `save_tokens_bin` writes raw little-endian uint16/uint32 token files, `load_tokens_bin` memory-maps them read-only and widens zero-copy via `torch.frombuffer` into a `torch.long` tensor, and `dataset_stats` summarizes splits (token counts, id ranges, top-10 tokens with decoded previews when `<prefix>train.bin.vocab.json` exists) — exposed as `python -m gpt_from_scratch.dataset --bin-prefix data/`.
+- `data.load_corpus` reads any UTF-8 `.txt`/`.md` corpus file with a clear error for unsupported suffixes.
+- Training on pre-tokenized data: `gpt-from-scratch-train --data-format bin` loads `{data-dir}/train.bin`, `val.bin`, and the sibling `train.bin.vocab.json` instead of downloading tiny Shakespeare (`text` remains the default).
+- Architecture flag `pre_norm` on `GPTConfig` (default `True`): `False` switches every block to original Transformer/GPT-1 post-norm for ablation studies.
+- Experiments package: a shared seeded short-run runner (`experiments/_runner.py`) reusing the trainer's data loading, batching, and evaluation helpers, plus two standalone CLIs — `python -m gpt_from_scratch.experiments.scaling` (val loss vs preset size across `GPT_PRESETS`, optional log-x plot) and `python -m gpt_from_scratch.experiments.lr_ablation` (constant vs cosine vs warmup+cosine twin runs differing only in schedule, schedule-overlay + loss-bar plot). Both print tables, write JSON results (`--out`), and need the plot extra only for `--plot`; see EXPERIMENTS.md.
+- Checkpoint export (`export.py`, run as `python -m gpt_from_scratch.export --format hf|onnx`): Hugging Face `GPT2LMHeadModel` directories (`config.json`, GPT-2-named `pytorch_model.bin` with attention/MLP weights transposed to Conv1D layout, token-to-id `vocab.json`) and ONNX graphs (opset 17, dynamic batch/sequence axes, `input_ids -> logits`). Configs outside the GPT-2-representable subset (learned positions, LayerNorm, GELU MLP, pre-norm, tied embeddings) raise `NotImplementedError`.
+- Serving (`serve.py`, requires the new `serve` extra): FastAPI app exposing OpenAI-compatible `POST /v1/completions` accepting `prompt`, `max_tokens`, `temperature`, `top_k`, `top_p`, and `stop`, returning `text_completion` objects with `finish_reason` (`stop`/`length`) and prompt/completion usage counts; run with `python -m gpt_from_scratch.serve --checkpoint ...`.
+- Model card template at `docs/model_card.md` with placeholder fields, HF-loading snippets, and a filled example row-set for the default shakespeare-char configuration.
+- CI/workflows: a mypy type-check job in CI (configuration under `[tool.mypy]`), `release.yml` running tests and uploading built sdist/wheel artifacts on `v*` tags, and `smoke.yml`, a manually triggered tiny end-to-end train + sample run that uploads its checkpoint.
+
+### Changed
+
+- Optional dependency groups expanded alongside `plot`: `serve` (fastapi + uvicorn) and `onnx` (onnxruntime); install together, e.g. `uv sync --extra plot --extra serve --extra onnx`.
+- `BPETokenizer.save` payloads now include `special_tokens`; loading older files without the key continues to work.
+
 ## [0.2.0] - 2026-08-22
 
 Second milestone: configurable architecture options, richer training diagnostics, a much more capable generation CLI, and analysis tooling.
@@ -50,5 +73,6 @@ First tagged release: a small from-scratch GPT in PyTorch with training, samplin
 - Generation runs on incremental KV-cache decoding by default, with an explicit causal mask when queries are shorter than the cached context.
 - Weight initialization follows GPT-2: normal(0, 0.02) everywhere with residual-output projections scaled down by `1/sqrt(2 * n_layer)` for training stability at depth.
 
+[0.3.0]: https://github.com/VictorMerk/gpt-from-scratch/releases/tag/v0.3.0
 [0.2.0]: https://github.com/VictorMerk/gpt-from-scratch/releases/tag/v0.2.0
 [0.1.0]: https://github.com/VictorMerk/gpt-from-scratch/releases/tag/v0.1.0

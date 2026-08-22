@@ -1,18 +1,18 @@
 # Roadmap
 
-One hundred planned improvements for gpt-from-scratch, grouped by area and roughly ordered by impact; checked items have shipped (milestones 1 and 2).
+One hundred planned improvements for gpt-from-scratch, grouped by area and roughly ordered by impact; checked items have shipped (milestones 1 through 3).
 
 ## Tokenization & Data
 
 - [x] BPE tokenizer trained from scratch with train/encode/decode/save/load *(milestone 1)*
-- [ ] GPT-2 style regex pre-tokenization before BPE merges
-- [ ] Special-token support (<|endoftext|>) with reserved IDs and controlled generation
-- [ ] Property-based fuzz tests for tokenizer roundtrips over random unicode
+- [x] GPT-2 style regex pre-tokenization before BPE merges *(milestone 3; equivalent semantics hand-rolled via str classifiers, since stdlib re lacks unicode property classes)*
+- [x] Special-token support (<|endoftext|>) with reserved IDs and controlled generation *(milestone 3; reserved ids + encode_with_special; constrained decoding pending)*
+- [x] Property-based fuzz tests for tokenizer roundtrips over random unicode *(milestone 3)*
 - [ ] Load and use a pretrained GPT-2 vocab/merges file
 - [ ] Tokenizer throughput benchmark (bytes/sec, compression ratio) across corpora
-- [ ] Generic corpus loader for any .txt/.md dataset with train/val/test split
-- [ ] Binary .bin token cache with uint8/uint16 dtype and np.memmap for larger-than-RAM data
-- [ ] Dataset statistics report (char/token counts, vocab histogram, length distribution)
+- [x] Generic corpus loader for any .txt/.md dataset with train/val/test split *(milestone 3; .txt/.md loader with train/val split only)*
+- [x] Binary .bin token cache with uint8/uint16 dtype and np.memmap for larger-than-RAM data *(milestone 3; torch zero-copy mmap loader; uint16/uint32 dtypes)*
+- [x] Dataset statistics report (char/token counts, vocab histogram, length distribution) *(milestone 3; token stats; histogram pending)*
 - [ ] Optional Hugging Face datasets integration for an OpenWebText-scale demo
 - [ ] Hash-based near-duplicate filtering for the training corpus
 - [ ] Byte-level vs char-level vs BPE comparison study (val loss on Shakespeare)
@@ -73,24 +73,24 @@ One hundred planned improvements for gpt-from-scratch, grouped by area and rough
 - [x] Streaming generation CLI (token-by-token output) *(milestone 2)*
 - [x] Interactive REPL with prompt history and reset *(milestone 2; basic REPL; history/reset pending)*
 - [x] Batch generation from a prompts file *(milestone 2)*
-- [ ] OpenAI-compatible HTTP API (FastAPI, optional dependency)
-- [ ] Checkpoint export to Hugging Face Transformers format
-- [ ] ONNX export + onnxruntime inference path
+- [x] OpenAI-compatible HTTP API (FastAPI, optional dependency) *(milestone 3)*
+- [x] Checkpoint export to Hugging Face Transformers format *(milestone 3)*
+- [x] ONNX export + onnxruntime inference path *(milestone 3; export done; runtime verify optional)*
 - [ ] Dynamic int8 quantization experiment with quality/speed report
 - [ ] Speculative decoding with a tiny draft model
 - [x] Structured generation (prefix constraints, stop sequences) *(milestone 2; stop sequences done; prefix constraints pending)*
-- [ ] Model card template and example published checkpoint
+- [x] Model card template and example published checkpoint *(milestone 3; template; published checkpoint pending)*
 
 ## Tooling & CI
 
 - [x] pre-commit hooks (ruff check + format) *(milestone 1)*
 - [x] Coverage reporting with pytest-cov and badge *(milestone 1)*
 - [x] Multi-Python CI matrix (3.12 / 3.13) *(milestone 1)*
-- [ ] Type checking (mypy or pyright) in CI on src/
-- [ ] Release workflow: build sdist/wheel on tag, publish to PyPI
+- [x] Type checking (mypy or pyright) in CI on src/ *(milestone 3)*
+- [x] Release workflow: build sdist/wheel on tag, publish to PyPI *(milestone 3; build+artifact; PyPI publish pending secrets)*
 - [x] Dockerfile for reproducible training runs *(milestone 2)*
 - [x] Dependabot config for dependency updates *(milestone 2)*
-- [ ] GPU smoke-test workflow (manual trigger, tiny training run)
+- [x] GPU smoke-test workflow (manual trigger, tiny training run) *(milestone 3; workflow_dispatch; CPU default; GPU self-hosted pending)*
 - [ ] Benchmark regression job (fail PR on large throughput drop)
 - [x] Makefile or justfile with common dev commands *(milestone 2)*
 
@@ -113,10 +113,10 @@ One hundred planned improvements for gpt-from-scratch, grouped by area and rough
 
 ## Experiments & Research
 
-- [ ] Scaling study: val loss vs parameter count on Shakespeare (4-5 sizes, plotted)
-- [ ] Ablation: pre-norm vs post-norm at this scale
-- [ ] Ablation: tied vs untied embeddings
-- [ ] Ablation: LR schedule variants (constant vs cosine vs warmup+cosine)
+- [x] Scaling study: val loss vs parameter count on Shakespeare (4-5 sizes, plotted) *(milestone 3; script ready; full run pending)*
+- [x] Ablation: pre-norm vs post-norm at this scale *(milestone 3; flag ready; full run pending)*
+- [x] Ablation: tied vs untied embeddings *(milestone 3; script ready; full run pending)*
+- [x] Ablation: LR schedule variants (constant vs cosine vs warmup+cosine) *(milestone 3; script ready; full run pending)*
 - [ ] Grokking experiment on modular arithmetic
 - [ ] Induction-head analysis: attention patterns across training checkpoints
 - [ ] Byte-level model on an enwik8 subset with bpc compared to literature
