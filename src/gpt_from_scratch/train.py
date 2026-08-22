@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
+import random
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -44,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--log-file", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--ema", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--save-top-k", type=int, default=0)
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--overfit-batches", type=int, default=0)
     return parser.parse_args()
 
 
@@ -55,6 +64,22 @@ def resolve_device(requested: str | None) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def enable_determinism(seed: int) -> None:
+    """Seed every reachable RNG and force deterministic kernels."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        import numpy
+    except ImportError:
+        pass  # numpy is optional and deliberately not a project dependency
+    else:
+        numpy.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
 
 
 def get_batch(
@@ -70,6 +95,47 @@ def get_batch(
         x = x.to(device)
         y = y.to(device)
     return x, y
+
+
+def build_overfit_batches(
+    data: torch.Tensor,
+    num_batches: int,
+    batch_size: int,
+    block_size: int,
+    device: torch.device,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Pre-sample a fixed batch pool for the --overfit-batches diagnostic."""
+    return [get_batch(data, batch_size, block_size, device) for _ in range(num_batches)]
+
+
+class ModelEMA:
+    """Exponential moving average over a model's state_dict tensors."""
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999) -> None:
+        if not 0.0 <= decay <= 1.0:
+            raise ValueError("decay must be in [0, 1]")
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {
+            name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for name, tensor in model.state_dict().items():
+            self.shadow[name].mul_(self.decay).add_(tensor.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_to(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        """Overwrite the model tensors with EMA values; pass the result to restore_from."""
+        backup = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+        for name, tensor in model.state_dict().items():
+            tensor.copy_(self.shadow[name])
+        return backup
+
+    @torch.no_grad()
+    def restore_from(self, model: torch.nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        for name, tensor in model.state_dict().items():
+            tensor.copy_(backup[name])
 
 
 def forward_loss(
@@ -106,6 +172,28 @@ def estimate_loss(
     return losses
 
 
+def checkpoint_dict(
+    model: GPT,
+    optimizer: torch.optim.Optimizer,
+    config: GPTConfig,
+    vocab: list[str],
+    iteration: int,
+    val_loss: float,
+    ema_state: dict[str, torch.Tensor] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": config.to_dict(),
+        "vocab": vocab,
+        "iteration": iteration,
+        "val_loss": val_loss,
+    }
+    if ema_state is not None:
+        payload["ema_state"] = ema_state
+    return payload
+
+
 def save_checkpoint(
     model: GPT,
     optimizer: torch.optim.Optimizer,
@@ -114,18 +202,72 @@ def save_checkpoint(
     iteration: int,
     val_loss: float,
     path: Path,
+    ema_state: dict[str, torch.Tensor] | None = None,
 ) -> None:
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "config": config.to_dict(),
-            "vocab": vocab,
-            "iteration": iteration,
-            "val_loss": val_loss,
-        },
-        path,
-    )
+    payload = checkpoint_dict(model, optimizer, config, vocab, iteration, val_loss, ema_state)
+    torch.save(payload, path)
+
+
+@dataclass(frozen=True)
+class TopKCheckpoint:
+    """One file managed by --save-top-k; ranked by val loss, ties broken by iteration."""
+
+    val_loss: float
+    iteration: int
+    path: Path
+
+
+def load_top_k_entries(out_dir: Path) -> list[TopKCheckpoint]:
+    entries: list[TopKCheckpoint] = []
+    for path in out_dir.glob("checkpoint-top*.pt"):
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        entries.append(
+            TopKCheckpoint(
+                float(ckpt.get("val_loss", float("inf"))),
+                int(ckpt.get("iteration", 0)),
+                path,
+            )
+        )
+    return sorted(entries, key=lambda entry: (entry.val_loss, entry.iteration))
+
+
+def update_top_k_checkpoints(
+    out_dir: Path,
+    val_loss: float,
+    iteration: int,
+    k: int,
+    build_checkpoint: Callable[[], dict[str, object]],
+    entries: list[TopKCheckpoint] | None = None,
+) -> list[TopKCheckpoint]:
+    """Keep the k best checkpoints by val loss as out_dir/checkpoint-top{i}.pt.
+
+    Every surviving file is rewritten with ``build_checkpoint()`` plus its 1-based
+    ``rank``, while keeping the ``val_loss``/``iteration`` of the eval that earned
+    its spot; worse checkpoints are pruned. Returns the survivors, best first.
+    Pass ``entries=None`` to rediscover existing files from disk.
+    """
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if entries is None:
+        entries = load_top_k_entries(out_dir)
+    candidate = TopKCheckpoint(float(val_loss), int(iteration), Path())
+    survivors = sorted([*entries, candidate], key=lambda entry: (entry.val_loss, entry.iteration))[
+        :k
+    ]
+    written: list[TopKCheckpoint] = []
+    for rank, entry in enumerate(survivors, start=1):
+        path = out_dir / f"checkpoint-top{rank}.pt"
+        payload = dict(build_checkpoint())
+        payload["rank"] = rank
+        payload["val_loss"] = entry.val_loss
+        payload["iteration"] = entry.iteration
+        torch.save(payload, path)
+        written.append(TopKCheckpoint(entry.val_loss, entry.iteration, path))
+    kept_names = {entry.path.name for entry in written}
+    for path in out_dir.glob("checkpoint-top*.pt"):
+        if path.name not in kept_names:
+            path.unlink(missing_ok=True)
+    return written
 
 
 def format_eta(seconds: float) -> str:
@@ -143,8 +285,13 @@ def main() -> None:
     args = parse_args()
     if args.grad_accum < 1:
         raise ValueError("grad_accum must be at least 1")
+    if args.deterministic:
+        # Must exist before the CUDA context is created or cuBLAS ignores it.
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
+    if args.deterministic:
+        enable_determinism(args.seed)
 
     text_path = download_tiny_shakespeare(args.data_dir)
     train_text, val_text = train_val_split(load_text(text_path))
@@ -152,6 +299,16 @@ def main() -> None:
     train_data = torch.tensor(tokenizer.encode(train_text), dtype=torch.long)
     val_data = torch.tensor(tokenizer.encode(val_text), dtype=torch.long)
     splits = {"train": train_data, "val": val_data}
+
+    overfit_batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    if args.overfit_batches > 0:
+        print(
+            f"WARNING: overfit diagnostic mode: training only on {args.overfit_batches} "
+            "fixed batch(es); losses measure memorization, not generalization"
+        )
+        overfit_batches = build_overfit_batches(
+            train_data, args.overfit_batches, args.batch_size, args.block_size, device
+        )
 
     config = GPTConfig(
         vocab_size=tokenizer.vocab_size,
@@ -163,6 +320,7 @@ def main() -> None:
     )
     model = GPT(config).to(device)
     optimizer = model.configure_optimizers(lr=args.lr, weight_decay=args.weight_decay)
+    ema: ModelEMA | None = ModelEMA(model, decay=args.ema_decay) if args.ema else None
 
     start_iter = 0
     best_val_loss = float("inf")
@@ -180,7 +338,31 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     print(f"device={device} parameters={model.num_parameters():,}")
 
+    def run_eval() -> dict[str, float]:
+        if ema is None:
+            return estimate_loss(model, splits, args, device, amp_dtype)
+        backup = ema.apply_to(model)
+        try:
+            return estimate_loss(model, splits, args, device, amp_dtype)
+        finally:
+            ema.restore_from(model, backup)
+
+    def current_payload() -> dict[str, object]:
+        # update_top_k_checkpoints stamps the real rank/val_loss/iteration per entry.
+        return checkpoint_dict(
+            model,
+            optimizer,
+            config,
+            tokenizer.vocab,
+            iteration=0,
+            val_loss=float("inf"),
+            ema_state=None if ema is None else ema.shadow,
+        )
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    top_k_entries: list[TopKCheckpoint] | None = (
+        load_top_k_entries(args.out_dir) if args.save_top_k > 0 else None
+    )
     tokens_per_step = args.batch_size * args.block_size * args.grad_accum
     eval_start = time.time()
     last_eval_iter = start_iter
@@ -198,18 +380,23 @@ def main() -> None:
             group["lr"] = lr
 
         optimizer.zero_grad(set_to_none=True)
-        for _ in range(args.grad_accum):
-            x, y = get_batch(train_data, args.batch_size, args.block_size, device)
+        for accum_step in range(args.grad_accum):
+            if overfit_batches is not None:
+                x, y = overfit_batches[accum_step % len(overfit_batches)]
+            else:
+                x, y = get_batch(train_data, args.batch_size, args.block_size, device)
             loss = forward_loss(model, x, y, amp_dtype)
             scaler.scale(loss / args.grad_accum).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         scaler.step(optimizer)
         scaler.update()
+        if ema is not None:
+            ema.update(model)
         tokens_since_eval += tokens_per_step
 
         if iteration % args.eval_interval == 0 or iteration == args.max_iters:
-            losses = estimate_loss(model, splits, args, device, amp_dtype)
+            losses = run_eval()
             elapsed = time.time() - eval_start
             steps_since_eval = iteration - last_eval_iter
             tokens_per_sec = tokens_since_eval / elapsed if elapsed > 0 else 0.0
@@ -234,19 +421,42 @@ def main() -> None:
                 best_val_loss = losses["val"]
                 best_path = args.out_dir / "checkpoint-best.pt"
                 save_checkpoint(
-                    model, optimizer, config, tokenizer.vocab, iteration, best_val_loss, best_path
+                    model,
+                    optimizer,
+                    config,
+                    tokenizer.vocab,
+                    iteration,
+                    best_val_loss,
+                    best_path,
+                    ema_state=None if ema is None else ema.shadow,
                 )
                 print(f"saved checkpoint to {best_path}")
+            if top_k_entries is not None:
+                top_k_entries = update_top_k_checkpoints(
+                    args.out_dir,
+                    losses["val"],
+                    iteration,
+                    args.save_top_k,
+                    current_payload,
+                    top_k_entries,
+                )
             last_eval_iter = iteration
             tokens_since_eval = 0
             eval_start = time.time()
 
     if not losses:
-        losses = estimate_loss(model, splits, args, device, amp_dtype)
+        losses = run_eval()
 
     final_path = args.out_dir / "checkpoint.pt"
     save_checkpoint(
-        model, optimizer, config, tokenizer.vocab, args.max_iters, losses["val"], final_path
+        model,
+        optimizer,
+        config,
+        tokenizer.vocab,
+        args.max_iters,
+        losses["val"],
+        final_path,
+        ema_state=None if ema is None else ema.shadow,
     )
     meta = {"val_loss": losses["val"], "parameters": model.num_parameters()}
     (args.out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
