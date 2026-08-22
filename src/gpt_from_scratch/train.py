@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 
 from gpt_from_scratch.data import download_tiny_shakespeare, load_text, train_val_split
+from gpt_from_scratch.dataset import load_tokens_bin
 from gpt_from_scratch.model import GPT, GPTConfig
 from gpt_from_scratch.schedule import get_lr
 from gpt_from_scratch.tokenizer import CharTokenizer
@@ -24,9 +25,16 @@ DTYPES: dict[str, torch.dtype] = {
 }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a small GPT on tiny Shakespeare")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument(
+        "--data-format",
+        choices=["text", "bin"],
+        default="text",
+        help="'text' downloads tiny Shakespeare; 'bin' loads uint16 <data-dir>/train.bin "
+        "+ val.bin and the sibling train.bin.vocab.json",
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-iters", type=int, default=5000)
@@ -53,10 +61,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-top-k", type=int, default=0)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--overfit-batches", type=int, default=0)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def resolve_device(requested: str | None) -> torch.device:
+def resolve_device(requested: str | torch.device | None) -> torch.device:
     if requested:
         return torch.device(requested)
     if torch.cuda.is_available():
@@ -80,6 +88,50 @@ def enable_determinism(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True)
+
+
+def load_training_data(
+    data_dir: Path, data_format: str = "text"
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    """Load ``(train_ids, val_ids, vocab)`` for the requested ``--data-format``.
+
+    ``text`` downloads tiny Shakespeare into ``data_dir`` and derives a character
+    vocabulary; ``bin`` reads pre-tokenized ``{data_dir}/train.bin`` and
+    ``{data_dir}/val.bin`` (uint16 ids, as written by ``save_tokens_bin``) plus
+    the sibling ``train.bin.vocab.json``.
+    """
+    if data_format == "bin":
+        return _load_pretokenized_bins(data_dir)
+    if data_format != "text":
+        raise ValueError(f"unsupported data_format {data_format!r}; expected 'text' or 'bin'")
+    text_path = download_tiny_shakespeare(data_dir)
+    train_text, val_text = train_val_split(load_text(text_path))
+    tokenizer = CharTokenizer.from_text(train_text + val_text)
+    train_ids = torch.tensor(tokenizer.encode(train_text), dtype=torch.long)
+    val_ids = torch.tensor(tokenizer.encode(val_text), dtype=torch.long)
+    return train_ids, val_ids, tokenizer.vocab
+
+
+def _load_pretokenized_bins(data_dir: Path) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    train_path = data_dir / "train.bin"
+    val_path = data_dir / "val.bin"
+    missing = [str(path) for path in (train_path, val_path) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"--data-format bin needs pre-tokenized token files; missing: "
+            f"{', '.join(missing)} (create them with gpt_from_scratch.dataset.save_tokens_bin)"
+        )
+    vocab_path = data_dir / "train.bin.vocab.json"
+    if not vocab_path.is_file():
+        raise FileNotFoundError(
+            f"--data-format bin needs the vocab file next to train.bin: {vocab_path}"
+        )
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+    if not isinstance(vocab, list) or not all(isinstance(token, str) for token in vocab):
+        raise ValueError(f"{vocab_path} must be a JSON array of strings")
+    train_ids = load_tokens_bin(train_path, dtype="uint16")
+    val_ids = load_tokens_bin(val_path, dtype="uint16")
+    return train_ids, val_ids, vocab
 
 
 def get_batch(
@@ -293,11 +345,8 @@ def main() -> None:
     if args.deterministic:
         enable_determinism(args.seed)
 
-    text_path = download_tiny_shakespeare(args.data_dir)
-    train_text, val_text = train_val_split(load_text(text_path))
-    tokenizer = CharTokenizer.from_text(train_text + val_text)
-    train_data = torch.tensor(tokenizer.encode(train_text), dtype=torch.long)
-    val_data = torch.tensor(tokenizer.encode(val_text), dtype=torch.long)
+    train_data, val_data, vocab = load_training_data(args.data_dir, args.data_format)
+    tokenizer = CharTokenizer(vocab=vocab)
     splits = {"train": train_data, "val": val_data}
 
     overfit_batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None
