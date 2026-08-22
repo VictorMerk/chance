@@ -13,3 +13,9 @@ wheels/
 data/
 checkpoints/
 *.pt
+
+# Tooling
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/

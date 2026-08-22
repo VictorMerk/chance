@@ -8,11 +8,14 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: uv sync --dev
       - name: Lint
@@ -20,4 +23,4 @@ jobs:
           uv run ruff check .
           uv run ruff format --check .
       - name: Test
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q --cov=gpt_from_scratch --cov-report=term-missing
