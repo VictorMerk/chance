@@ -36,7 +36,7 @@ jobs:
             --device ${{ inputs.device }} \
             --out-dir smoke-run
       - name: Upload checkpoint
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-checkpoint
           path: smoke-run/checkpoint.pt
