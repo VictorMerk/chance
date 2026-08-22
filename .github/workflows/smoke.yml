@@ -1,0 +1,45 @@
+name: Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device to train on"
+        type: choice
+        options: ["cpu"]
+        default: cpu
+      max_iters:
+        description: "Number of training iterations"
+        type: number
+        default: 50
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Train tiny model
+        run: |
+          gpt-from-scratch-train \
+            --max-iters ${{ inputs.max_iters }} \
+            --n-layer 2 \
+            --n-head 2 \
+            --n-embd 128 \
+            --batch-size 16 \
+            --block-size 128 \
+            --device ${{ inputs.device }} \
+            --out-dir smoke-run
+      - name: Upload checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-checkpoint
+          path: smoke-run/checkpoint.pt
+          if-no-files-found: error
+      - name: Sample from checkpoint
+        run: gpt-from-scratch-sample --checkpoint smoke-run/checkpoint.pt --max-new-tokens 50

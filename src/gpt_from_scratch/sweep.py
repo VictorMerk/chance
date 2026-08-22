@@ -200,7 +200,13 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         device=device,
     )
-    rows.sort(key=lambda row: float(row["nll"]))
+
+    def _nll(row: GridRow) -> float:
+        value = row["nll"]
+        assert value is not None  # run_grid always sets nll
+        return float(value)
+
+    rows.sort(key=_nll)
     print(format_table(rows))
 
 
