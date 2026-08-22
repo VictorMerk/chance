@@ -38,7 +38,7 @@ gpt-from-scratch-plot = "gpt_from_scratch.plots:main"
 gpt-from-scratch-sweep = "gpt_from_scratch.sweep:main"
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.8", "mypy>=1.13"]
+dev = ["pytest>=9.1.1", "pytest-cov>=5.0", "ruff>=0.8", "mypy>=1.13"]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
